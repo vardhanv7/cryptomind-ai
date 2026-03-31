@@ -1,0 +1,21 @@
+# Environment variables (API keys - NEVER commit this!)
+.env
+
+# Log files
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Trade history (contains portfolio data)
+trades_history.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
