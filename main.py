@@ -103,6 +103,16 @@ def _get_daily_pnl() -> float:
     )
 
 
+def _holds_position(pair: str) -> bool:
+    """Return True if we currently have an open BUY position for this pair."""
+    return any(
+        t.get("pair") == pair
+        and t.get("action") == "BUY"
+        and t.get("status") == "open"
+        for t in _load_trade_history()
+    )
+
+
 def _get_portfolio_value(mode: str) -> float:
     """
     Fetch total portfolio value from Kraken paper/live status.
@@ -208,8 +218,10 @@ def run_trading_cycle(mode: str) -> int:
             # d. AI trade signal
             # ------------------------------------------------------------------
             recent_prices = df["close"].tolist()
+            holding       = _holds_position(pair)
             signal = ai_brain.get_trade_signal(
-                ind_data, recent_prices, current_price, pair_name
+                ind_data, recent_prices, current_price, pair_name,
+                holding=holding,
             )
             if not signal:
                 logger.warning(f"{pair_name}: no AI signal received -- skipping")
@@ -217,7 +229,24 @@ def run_trading_cycle(mode: str) -> int:
                 continue
 
             # ------------------------------------------------------------------
-            # e. Risk management
+            # e. Position-state guard (before risk management)
+            # Can't sell what we don't own; don't double-buy what we hold.
+            # ------------------------------------------------------------------
+            action_str = signal.get("action", "HOLD")
+            # holding was already computed before get_trade_signal call above
+
+            if action_str == "SELL" and not holding:
+                logger.info(f"{pair_name}: Skipped SELL - no position held")
+                print(f"    [SKIP] Skipped SELL - no position held for {pair_name}")
+                continue
+
+            if action_str == "BUY" and holding:
+                logger.info(f"{pair_name}: Skipped BUY - already holding {pair_name}")
+                print(f"    [SKIP] Skipped BUY - already holding {pair_name}")
+                continue
+
+            # ------------------------------------------------------------------
+            # f. Risk management
             # ------------------------------------------------------------------
             open_pos       = _get_open_position_count()
             daily_pnl      = _get_daily_pnl()
@@ -231,7 +260,6 @@ def run_trading_cycle(mode: str) -> int:
                 daily_pnl        = daily_pnl,
             )
 
-            action_str = signal.get("action", "HOLD")
             conf_str   = f"{signal.get('confidence', 0):.0%}"
             print(
                 f"    Signal : {action_str:4s}  confidence={conf_str}  |  "
@@ -247,7 +275,7 @@ def run_trading_cycle(mode: str) -> int:
                 continue
 
             # ------------------------------------------------------------------
-            # f. Execute trade
+            # g. Execute trade
             # ------------------------------------------------------------------
             amount       = TRADE_AMOUNT.get(pair, 0.001)
             trade_result = trader.execute_trade(action_str, pair, amount, mode)
@@ -344,7 +372,7 @@ def _print_banner(mode: str) -> None:
     print("=" * 62)
     print(f"  Mode      : {mode.upper()}")
     print(f"  Pairs     : {', '.join(PAIR_NAMES.get(p, p) for p in TRADING_PAIRS)}")
-    print(f"  Interval  : {TRADE_INTERVAL // 60} minutes between cycles")
+    print(f"  Interval  : {TRADE_INTERVAL // 60} minutes between cycles (default)")
     amounts = ", ".join(
         f"{PAIR_NAMES.get(p, p)}={v}" for p, v in TRADE_AMOUNT.items()
     )
@@ -434,8 +462,22 @@ def main() -> None:
         default="paper",
         help="Trading mode: 'paper' (simulated, default) or 'live' (real money)",
     )
-    args   = parser.parse_args()
-    MODE   = args.mode
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=None,
+        help="Stop after N cycles (default: run forever)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help="Seconds between cycles (default: 900 / 15 min)",
+    )
+    args     = parser.parse_args()
+    MODE     = args.mode
+    interval = args.interval if args.interval is not None else TRADE_INTERVAL
+    max_cycles = args.cycles  # None = unlimited
 
     # --- Logger + signal handler ---
     logger = setup_logger()
@@ -450,9 +492,10 @@ def main() -> None:
         sys.exit(1)
 
     logger.info(f"CryptoMind AI started in {MODE.upper()} mode")
+    cycles_label = str(max_cycles) if max_cycles else "unlimited"
     print(
-        f"\n[Startup] Trading loop started "
-        f"(cycle every {TRADE_INTERVAL // 60} min).  "
+        f"\n[Startup] Trading loop started  "
+        f"({cycles_label} cycle(s), {interval}s apart).  "
         f"Press Ctrl+C to stop gracefully.\n"
     )
 
@@ -460,7 +503,7 @@ def main() -> None:
 
     while _running:
         cycle_count += 1
-        logger.info(f"=== Cycle #{cycle_count} ===")
+        logger.info(f"=== Cycle #{cycle_count}/{cycles_label} ===")
 
         try:
             run_trading_cycle(MODE)
@@ -472,14 +515,18 @@ def main() -> None:
             )
             print(f"\n[Main] Cycle #{cycle_count} failed: {exc} -- continuing")
 
+        # Stop after max_cycles if specified
+        if max_cycles is not None and cycle_count >= max_cycles:
+            print(f"\n[Main] Reached {max_cycles} cycle(s) -- stopping.")
+            break
+
         if not _running:
             break
 
-        print(
-            f"\n[Main] Cycle #{cycle_count} done.  "
-            f"Next cycle in {TRADE_INTERVAL // 60} min."
-        )
-        _countdown(TRADE_INTERVAL)
+        mins, secs = divmod(interval, 60)
+        interval_label = f"{mins}m {secs}s" if mins else f"{secs}s"
+        print(f"\n[Main] Cycle #{cycle_count} done.  Next in {interval_label}.")
+        _countdown(interval)
 
     _shutdown(cycle_count)
 

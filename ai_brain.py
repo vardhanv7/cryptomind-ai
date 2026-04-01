@@ -31,7 +31,7 @@ last_request_time = 0
 MIN_REQUEST_GAP = 2  # Wait at least 2 seconds between requests (safe limit)
  
  
-def get_trade_signal(indicators, recent_prices, current_price, pair="BTCUSD"):
+def get_trade_signal(indicators, recent_prices, current_price, pair="BTCUSD", holding=False):
     """
     Send indicator data to Groq AI and get a trading decision.
     
@@ -86,20 +86,67 @@ def get_trade_signal(indicators, recent_prices, current_price, pair="BTCUSD"):
         price_change_24h = ((current_price - recent_prices[0]) / recent_prices[0]) * 100
     else:
         price_change_24h = 0.0
-    
+
+    # --- Step 3b: Detect market regime ---
+    # [CHANGE] Four-state regime detection feeds directly into the prompt so the
+    # AI has an explicit, pre-computed context rather than inferring it itself.
+    rsi          = indicators.get('rsi', 50) or 50
+    bb_upper     = indicators.get('bollinger_upper') or 0
+    bb_lower     = indicators.get('bollinger_lower') or 0
+    bb_width     = bb_upper - bb_lower if (bb_upper and bb_lower) else 0
+
+    # How far is the current price from each band, expressed as % of band width?
+    # A value < 15 means the price is hugging that band.
+    pct_from_lower = ((current_price - bb_lower) / bb_width * 100) if bb_width > 0 else 50
+    pct_from_upper = ((bb_upper - current_price) / bb_width * 100) if bb_width > 0 else 50
+
+    if rsi < 30:
+        market_regime = "OVERSOLD — RSI below 30, high-probability bounce BUY zone"
+        regime_bias   = "BUY"
+    elif rsi > 70:
+        market_regime = "OVERBOUGHT — RSI above 70, high-probability SELL/fade zone"
+        regime_bias   = "SELL"
+    elif pct_from_lower < 15:
+        market_regime = "NEAR LOWER BOLLINGER BAND — price at support, potential BUY"
+        regime_bias   = "BUY"
+    elif pct_from_upper < 15:
+        market_regime = "NEAR UPPER BOLLINGER BAND — price at resistance, potential SELL"
+        regime_bias   = "SELL"
+    else:
+        market_regime = "NEUTRAL — no extreme readings, look for momentum signals"
+        regime_bias   = "NEUTRAL"
+
     # --- Step 4: Build the AI prompt ---
-    # This tells the AI everything about the current market situation
-    # Similar to how you'd analyze a stock on NSE/BSE — same indicators!
-    prompt = f"""You are an expert crypto trading analyst. Analyze the following technical indicators and market data for {pair}, then provide a trading decision.
- 
+    # Position status drives which actions are valid.
+    if holding:
+        position_status = f"HOLDING {pair} — position is open"
+        valid_actions   = "SELL or HOLD  (BUY is NOT valid — already holding)"
+    else:
+        position_status = f"NOT HOLDING {pair} — no open position"
+        valid_actions   = "BUY or HOLD  (SELL is NOT valid — nothing to sell)"
+
+    prompt = f"""You are a short-term swing trader, not a long-term investor. Be decisive.
+Analyze the following data for {pair} and make a clear BUY, SELL, or HOLD decision.
+Your timeframe is 15 minutes to 4 hours — you are hunting short-term opportunities.
+
 === CURRENT MARKET DATA ===
 Asset: {pair}
 Current Price: ${current_price:,.2f}
 24h Price Change: {price_change_24h:+.2f}%
 Recent Prices (oldest to newest): {[round(p, 2) for p in recent_prices[-10:]]}
- 
+
+=== MARKET REGIME ===
+Regime: {market_regime}
+Regime Bias: {regime_bias}
+
+=== POSITION STATUS ===
+Current position: {position_status}
+VALID ACTIONS FOR THIS TRADE: {valid_actions}
+You MUST only respond with one of the valid actions above. Choosing an invalid action wastes the trade opportunity.
+
 === TECHNICAL INDICATORS ===
 RSI (14-period): {indicators.get('rsi', 'N/A')}
+  → Interpretation: {"OVERSOLD — bounce likely" if rsi < 30 else "OVERBOUGHT — pullback likely" if rsi > 70 else "Neutral range"}
 SMA (20-period): {indicators.get('sma_20', 'N/A')}
 SMA (50-period): {indicators.get('sma_50', 'N/A')}
 EMA (12-period): {indicators.get('ema_12', 'N/A')}
@@ -108,21 +155,26 @@ MACD Line: {indicators.get('macd', 'N/A')}
 MACD Signal: {indicators.get('macd_signal', 'N/A')}
 Bollinger Upper Band: {indicators.get('bollinger_upper', 'N/A')}
 Bollinger Lower Band: {indicators.get('bollinger_lower', 'N/A')}
+  → Price is {pct_from_lower:.1f}% of band-width above the lower band
+  → Price is {pct_from_upper:.1f}% of band-width below the upper band
 Volume Trend: {indicators.get('volume_trend', 'N/A')}
 Price vs SMA: {indicators.get('price_vs_sma', 'N/A')}
 Overall Trend: {indicators.get('trend', 'N/A')}
- 
+
 === TRADING RULES ===
-- Only suggest BUY if there are clear bullish signals
-- Only suggest SELL if there are clear bearish signals
-- Suggest HOLD if signals are mixed or unclear
-- Be conservative — protecting capital is more important than making profit
-- Consider RSI overbought (>70) and oversold (<30) levels
- 
+- You are a SHORT-TERM swing trader targeting 15min–4hr moves.
+- Small dips of 1–3% in an otherwise stable asset are BUYING opportunities, not reasons to HOLD.
+- Even in a broader bearish market, there are bounce trades to catch — find them.
+- Use HOLD ONLY when indicators are genuinely mixed with no clear edge.
+- If the market regime is OVERSOLD or near the lower Bollinger Band, lean BUY.
+- If the market regime is OVERBOUGHT or near the upper Bollinger Band, lean SELL.
+- A bearish overall trend does NOT automatically mean HOLD — look for the bounce.
+- Be decisive: a clear signal at 55% confidence is better than a paralysed HOLD.
+
 === RESPONSE FORMAT ===
 Respond with ONLY a valid JSON object, no extra text before or after:
 {{
-    "action": "BUY" or "SELL" or "HOLD",
+    "action": {valid_actions},
     "confidence": 0.0 to 1.0,
     "reason": "brief 1-2 sentence explanation",
     "suggested_size": "small" or "medium" or "large",
@@ -143,8 +195,19 @@ Respond with ONLY a valid JSON object, no extra text before or after:
             "model": GROQ_MODEL,
             "messages": [
                 {
+                    # [CHANGE] System prompt now establishes the short-term swing
+                    # trader persona upfront, before any market data is shown.
                     "role": "system",
-                    "content": "You are a crypto trading analyst. Respond ONLY with a valid JSON object. No markdown, no code blocks, no extra text."
+                    "content": (
+                        "You are an aggressive short-term crypto swing trader. "
+                        "Your job is to find and act on short-term price opportunities "
+                        "(15 min to 4 hr timeframe). "
+                        "HOLD is your last resort — only use it when there is genuinely "
+                        "no edge in either direction. "
+                        "In bearish markets, you look for bounce trades. "
+                        "In bullish markets, you look for continuation entries. "
+                        "Respond ONLY with a valid JSON object. No markdown, no code blocks, no extra text."
+                    )
                 },
                 {
                     "role": "user",
@@ -190,7 +253,21 @@ Respond with ONLY a valid JSON object, no extra text before or after:
         
         # Validate confidence is between 0 and 1
         signal["confidence"] = max(0.0, min(1.0, float(signal["confidence"])))
-        
+
+        # [CHANGE] Override suggested_size based on confidence bands.
+        # This ensures trade sizing is always consistent regardless of what
+        # the AI returns, and scales risk up only when conviction is high.
+        #   0.50 – 0.60  →  small   (cautious entry)
+        #   0.60 – 0.75  →  medium  (moderate conviction)
+        #   0.75 +       →  large   (high conviction)
+        conf = signal["confidence"]
+        if conf >= 0.75:
+            signal["suggested_size"] = "large"
+        elif conf >= 0.60:
+            signal["suggested_size"] = "medium"
+        else:
+            signal["suggested_size"] = "small"
+
         # Validate stop_loss and take_profit are numbers
         signal["stop_loss_pct"] = float(signal.get("stop_loss_pct", 3.0))
         signal["take_profit_pct"] = float(signal.get("take_profit_pct", 5.0))
@@ -271,11 +348,12 @@ def should_trade(signal, portfolio_value=10000, open_positions=0,
     if action == "BUY" and open_positions >= 3:
         return False, f"Already have {open_positions} open positions (max 3)"
     
-    # Rule 4: Cooldown — wait at least 30 minutes between trades
+    # Rule 4: Cooldown — wait at least 10 minutes between trades
+    # [CHANGE] Reduced from 30 min → 10 min to allow catching short-term swings.
     current_time = time.time()
     minutes_since_last = (current_time - last_trade_time) / 60
-    if last_trade_time > 0 and minutes_since_last < 30:
-        return False, f"Cooldown active: only {minutes_since_last:.0f}min since last trade (need 30min)"
+    if last_trade_time > 0 and minutes_since_last < 10:
+        return False, f"Cooldown active: only {minutes_since_last:.0f}min since last trade (need 10min)"
     
     # Rule 5: Daily loss limit — stop if lost more than 10% today
     daily_loss_limit = portfolio_value * 0.10  # 10% of portfolio
