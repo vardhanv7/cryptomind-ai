@@ -13,11 +13,27 @@ Always defaults to paper mode — never risks real money unless explicitly set.
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
 import time
 from datetime import datetime
+
+# Base-asset ticker for each Kraken pair (used for balance checks)
+_PAIR_BASE = {
+    "XXBTZUSD": "BTC",
+    "XETHZUSD": "ETH",
+    "SOLUSD":   "SOL",
+    "XBTUSDT":  "BTC",
+    "ETHUSDT":  "ETH",
+}
+
+# Path to Kraken CLI paper trading state file
+_PAPER_STATE = os.path.join(
+    os.path.expanduser("~"),
+    "AppData", "Roaming", "kraken", "paper", "state.json"
+)
 
 # Windows terminals default to cp1252 which can't print many CLI outputs.
 # Force UTF-8 so Kraken CLI responses display correctly.
@@ -72,6 +88,23 @@ def _run_trade_command(command):
     except Exception as e:
         logger.error(f"Unexpected error running Kraken CLI: {e}")
         return False, "", str(e)
+
+
+def _get_paper_balance(pair) -> float:
+    """
+    Return the actual held balance of the base asset for a pair,
+    reading directly from the Kraken CLI paper state file.
+    Returns 0.0 on any error (fail-safe: assume nothing held).
+    """
+    base = _PAIR_BASE.get(pair)
+    if not base:
+        return 0.0
+    try:
+        with open(_PAPER_STATE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return float(state.get("balances", {}).get(base, 0.0))
+    except Exception:
+        return 0.0
 
 
 def _parse_trade_output(output):
@@ -180,6 +213,23 @@ def execute_trade(action, pair, amount, mode="paper"):
             "timestamp": datetime.now().isoformat(),
             "success": False, "error": msg, "raw_output": ""
         }
+
+    # Guard: refuse SELL if we don't actually hold the base asset
+    if action == "SELL" and mode == "paper":
+        held = _get_paper_balance(pair)
+        if held < amount:
+            msg = (
+                f"SELL skipped — paper balance for {pair_name} is "
+                f"{held} (need {amount})"
+            )
+            logger.warning(msg)
+            print(f"[Trader] [SKIP] {msg}")
+            return {
+                "pair": pair, "action": action, "amount": amount,
+                "price": None, "order_id": None, "mode": mode,
+                "timestamp": datetime.now().isoformat(),
+                "success": False, "error": msg, "raw_output": ""
+            }
 
     # Build CLI command
     verb = action.lower()

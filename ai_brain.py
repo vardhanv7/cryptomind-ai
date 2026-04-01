@@ -23,8 +23,9 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
  
 # Groq API settings
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_API_URL      = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL        = "llama-3.3-70b-versatile"
+GROQ_MODEL_FALLBACK = "llama-3.1-8b-instant"   # used when primary hits 429
  
 # Rate limit tracking (Groq free tier = 30 requests/min)
 last_request_time = 0
@@ -220,8 +221,25 @@ Respond with ONLY a valid JSON object, no extra text before or after:
         
         response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
         last_request_time = time.time()  # Update rate limit tracker
-        
-        # --- Step 6: Check for API errors ---
+
+        # --- Step 6: Handle 429 rate-limit with model fallback ---
+        if response.status_code == 429:
+            print(
+                f"[AI Brain] Rate limit (429) on {GROQ_MODEL} — "
+                f"falling back to {GROQ_MODEL_FALLBACK}"
+            )
+            payload["model"] = GROQ_MODEL_FALLBACK
+            response = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=30)
+            last_request_time = time.time()
+            if response.status_code == 200:
+                print(f"[AI Brain] Fallback model {GROQ_MODEL_FALLBACK} succeeded")
+            else:
+                print(
+                    f"[AI Brain] Fallback also failed: "
+                    f"Status {response.status_code} — {response.text}"
+                )
+                return None
+
         if response.status_code != 200:
             print(f"[AI Brain] API Error: Status {response.status_code}")
             print(f"[AI Brain] Response: {response.text}")
