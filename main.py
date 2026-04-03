@@ -56,6 +56,7 @@ MODE = "paper"  # reassigned after argparse
 # Session state (in-memory, reset each run)
 # ---------------------------------------------------------------------------
 _last_trade_time: dict[str, float] = {}   # {pair: unix timestamp}
+_hold_counter:    dict[str, int]   = {}   # {pair: consecutive HOLD count}
 _running = True                           # set False by SIGINT handler
 
 
@@ -113,6 +114,28 @@ def _holds_position(pair: str) -> bool:
     )
 
 
+def _get_position_pnl_pct(pair: str, current_price: float):
+    """Return unrealized PnL % for the open position on this pair, or None."""
+    for t in _load_trade_history():
+        if (t.get("pair") == pair
+                and t.get("action") == "BUY"
+                and t.get("status") == "open"
+                and t.get("price")):
+            entry = float(t["price"])
+            if entry > 0:
+                return ((current_price - entry) / entry) * 100
+    return None
+
+
+def _get_all_holdings() -> list:
+    """Return display names of all currently held pairs (open BUY positions)."""
+    return [
+        PAIR_NAMES.get(t["pair"], t["pair"])
+        for t in _load_trade_history()
+        if t.get("action") == "BUY" and t.get("status") == "open"
+    ]
+
+
 def _get_portfolio_value(mode: str) -> float:
     """
     Fetch total portfolio value from Kraken paper/live status.
@@ -155,6 +178,7 @@ def run_trading_cycle(mode: str) -> int:
     cycle_ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     current_prices: dict[str, float] = {}
     trades_done = 0
+    all_holdings = _get_all_holdings()   # computed once per cycle
 
     print("\n" + "=" * 62)
     print(f"  TRADING CYCLE  |  {cycle_ts}  |  MODE: {mode.upper()}")
@@ -217,27 +241,43 @@ def run_trading_cycle(mode: str) -> int:
             # ------------------------------------------------------------------
             # d. AI trade signal
             # ------------------------------------------------------------------
-            recent_prices = df["close"].tolist()
-            holding       = _holds_position(pair)
+            recent_prices  = df["close"].tolist()
+            holding        = _holds_position(pair)
+            open_pnl_pct   = _get_position_pnl_pct(pair, current_price) if holding else None
+            force_decisive = _hold_counter.get(pair, 0) >= 3
+
             signal = ai_brain.get_trade_signal(
                 ind_data, recent_prices, current_price, pair_name,
-                holding=holding,
+                holding        = holding,
+                open_pnl_pct   = open_pnl_pct,
+                force_decisive = force_decisive,
+                all_holdings   = all_holdings,
             )
             if not signal:
                 logger.warning(f"{pair_name}: no AI signal received -- skipping")
                 print(f"    [SKIP] AI signal unavailable")
                 continue
 
+            action_str = signal.get("action", "HOLD")
+
+            # Track consecutive HOLDs per pair; reset on any actionable signal
+            if action_str == "HOLD":
+                _hold_counter[pair] = _hold_counter.get(pair, 0) + 1
+                if force_decisive:
+                    # We forced a re-evaluation — reset regardless
+                    _hold_counter[pair] = 0
+            else:
+                _hold_counter[pair] = 0
+
             # ------------------------------------------------------------------
             # e. Position-state guard (before risk management)
             # Can't sell what we don't own; don't double-buy what we hold.
+            # The AI enforces this too, but we double-check here as a hard guard.
             # ------------------------------------------------------------------
-            action_str = signal.get("action", "HOLD")
-            # holding was already computed before get_trade_signal call above
-
             if action_str == "SELL" and not holding:
-                logger.info(f"{pair_name}: Skipped SELL - no position held")
-                print(f"    [SKIP] Skipped SELL - no position held for {pair_name}")
+                msg = f"SKIPPED: AI suggested SELL for {pair_name} but no position held"
+                logger.info(msg)
+                print(f"    [SKIP] {msg}")
                 continue
 
             if action_str == "BUY" and holding:
@@ -315,12 +355,34 @@ def run_trading_cycle(mode: str) -> int:
     if current_prices:
         print("\n  [Position check]  stop-loss / take-profit sweep...")
         try:
-            # Build alias dict so update_positions can find prices
-            # (it accepts both "BTCUSD" and "XXBTZUSD" style keys)
             result = portfolio.update_positions(current_prices)
             if result["auto_closed"]:
-                print(f"    Auto-closed: {result['auto_closed']}")
+                print(f"    Auto-closed (portfolio): {result['auto_closed']}")
                 logger.info(f"Auto-closed positions: {result['auto_closed']}")
+
+                # Execute the actual SELL on Kraken for each auto-closed position
+                for details in result.get("auto_closed_details", []):
+                    try:
+                        sell_result = trader.execute_trade(
+                            "SELL", details["pair"], details["amount"], mode
+                        )
+                        if sell_result and sell_result.get("success"):
+                            logger.info(
+                                f"Stop-loss/TP SELL executed on Kraken: "
+                                f"{details['trade_id']} {details['pair']}"
+                            )
+                        else:
+                            err = (sell_result or {}).get("error", "unknown")
+                            logger.warning(
+                                f"Stop-loss/TP SELL failed for "
+                                f"{details['trade_id']}: {err}"
+                            )
+                    except Exception as sell_exc:
+                        logger.error(
+                            f"Error executing auto-close SELL for "
+                            f"{details['trade_id']}: {sell_exc}",
+                            exc_info=True,
+                        )
             else:
                 print("    No auto-closes triggered")
         except Exception as exc:
@@ -490,6 +552,15 @@ def main() -> None:
     if not _verify_kraken_cli():
         print("[Startup] Cannot proceed without Kraken CLI.  Exiting.")
         sys.exit(1)
+
+    # --- Reconcile internal portfolio state with Kraken paper state ---
+    print(f"\n[Startup] Reconciling portfolio state with Kraken {MODE} state...")
+    try:
+        portfolio.reconcile_state(MODE)
+        print("[Startup] Reconciliation complete.")
+    except Exception as exc:
+        logger.warning(f"Reconciliation failed (non-fatal): {exc}")
+        print(f"[Startup] Warning: reconciliation failed — {exc}")
 
     logger.info(f"CryptoMind AI started in {MODE.upper()} mode")
     cycles_label = str(max_cycles) if max_cycles else "unlimited"

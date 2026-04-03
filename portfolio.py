@@ -12,6 +12,7 @@ a matching SELL closes it and locks in the realized PnL.
 """
 
 import json
+import os
 import sys
 from datetime import datetime
 
@@ -127,26 +128,32 @@ def record_trade(trade_details):
             "order_id":        trade_details.get("order_id"),
         }
 
-        # SELL: match to oldest open BUY on the same pair (FIFO) and book PnL
-        if action == "SELL" and price is not None:
-            exit_price = float(price)
+        # SELL: match to oldest open BUY on the same pair (FIFO) and book PnL.
+        # Close the position even when price is None so portfolio stays in sync
+        # with actual Kraken state (price=None → PnL recorded as 0.0).
+        if action == "SELL":
+            exit_price = float(price) if price is not None else None
             for t in history:                          # oldest first = FIFO
                 if (t.get("pair") == pair
                         and t.get("action") == "BUY"
-                        and t.get("status") == "open"
-                        and t.get("price") is not None):
-                    entry_price = float(t["price"])
-                    pnl         = round((exit_price - entry_price) * amount, 4)
-                    t["status"]       = "closed"
-                    t["closed_at"]    = record["timestamp"]
-                    t["close_price"]  = exit_price
-                    t["pnl"]          = pnl
+                        and t.get("status") == "open"):
+                    entry_price = t.get("price")
+                    if exit_price is not None and entry_price is not None:
+                        pnl = round((exit_price - float(entry_price)) * amount, 4)
+                    else:
+                        pnl = 0.0
+                    t["status"]         = "closed"
+                    t["closed_at"]      = record["timestamp"]
+                    t["close_price"]    = exit_price
+                    t["pnl"]            = pnl
                     t["unrealized_pnl"] = None
-                    record["pnl"]           = pnl
-                    record["matched_buy_id"] = t["trade_id"]
+                    record["pnl"]            = pnl
+                    record["matched_buy_id"] = t.get("trade_id")
+                    entry_disp = f"${float(entry_price):,.2f}" if entry_price else "N/A"
+                    exit_disp  = f"${exit_price:,.2f}" if exit_price else "N/A"
                     logger.info(
-                        f"Closed {pair} [{t['trade_id']}]: "
-                        f"entry=${entry_price:,.2f}, exit=${exit_price:,.2f}, "
+                        f"Closed {pair} [{t.get('trade_id')}]: "
+                        f"entry={entry_disp}, exit={exit_disp}, "
                         f"PnL=${pnl:+.4f}"
                     )
                     break
@@ -183,11 +190,12 @@ def update_positions(current_prices):
             updated    : list of (trade_id, unrealized_pnl) for each open position
             auto_closed: list of trade_ids that were automatically closed
     """
-    logger     = get_logger()
-    history    = _load_history()
-    updated    = []
-    auto_closed = []
-    changed    = False
+    logger             = get_logger()
+    history            = _load_history()
+    updated            = []
+    auto_closed        = []
+    auto_closed_details = []   # {trade_id, pair, amount} for Kraken SELL execution
+    changed            = False
 
     for trade in history:
         if trade.get("status") != "open" or trade.get("action") != "BUY":
@@ -227,20 +235,24 @@ def update_positions(current_prices):
         # Auto-close: stop-loss
         if pct_change <= -sl_pct:
             logger.warning(
-                f"STOP-LOSS triggered [{trade['trade_id']}] {pair_name}: "
-                f"{pct_change:.2f}% <= -{sl_pct}%"
+                f"STOP-LOSS TRIGGERED for {pair_name} at ${current:,.2f}, "
+                f"loss was {pct_change:.2f}% (threshold: -{sl_pct}%) "
+                f"[{trade['trade_id']}]"
             )
             print(
-                f"[Portfolio] STOP-LOSS hit: {pair_name} {pct_change:+.2f}% "
-                f"(limit: -{sl_pct}%) — auto-closing position"
+                f"[Portfolio] STOP-LOSS TRIGGERED for {pair_name} at "
+                f"${current:,.2f}, loss was {pct_change:+.2f}% — auto-closing"
             )
-            trade["status"]       = "closed"
-            trade["closed_at"]    = datetime.now().isoformat()
-            trade["close_price"]  = current
-            trade["pnl"]          = unrealized_pnl
-            trade["close_reason"] = "stop_loss"
+            trade["status"]         = "closed"
+            trade["closed_at"]      = datetime.now().isoformat()
+            trade["close_price"]    = current
+            trade["pnl"]            = unrealized_pnl
+            trade["close_reason"]   = "stop_loss"
             trade["unrealized_pnl"] = None
             auto_closed.append(trade["trade_id"])
+            auto_closed_details.append(
+                {"trade_id": trade["trade_id"], "pair": pair, "amount": amount}
+            )
 
         # Auto-close: take-profit
         elif pct_change >= tp_pct:
@@ -252,13 +264,16 @@ def update_positions(current_prices):
                 f"[Portfolio] TAKE-PROFIT hit: {pair_name} {pct_change:+.2f}% "
                 f"(target: {tp_pct}%) — auto-closing position"
             )
-            trade["status"]       = "closed"
-            trade["closed_at"]    = datetime.now().isoformat()
-            trade["close_price"]  = current
-            trade["pnl"]          = unrealized_pnl
-            trade["close_reason"] = "take_profit"
+            trade["status"]         = "closed"
+            trade["closed_at"]      = datetime.now().isoformat()
+            trade["close_price"]    = current
+            trade["pnl"]            = unrealized_pnl
+            trade["close_reason"]   = "take_profit"
             trade["unrealized_pnl"] = None
             auto_closed.append(trade["trade_id"])
+            auto_closed_details.append(
+                {"trade_id": trade["trade_id"], "pair": pair, "amount": amount}
+            )
 
     if changed:
         _save_history(history)
@@ -267,7 +282,109 @@ def update_positions(current_prices):
             f"{len(auto_closed)} auto-closed"
         )
 
-    return {"updated": updated, "auto_closed": auto_closed}
+    return {
+        "updated":             updated,
+        "auto_closed":         auto_closed,
+        "auto_closed_details": auto_closed_details,
+    }
+
+
+def reconcile_state(mode="paper"):
+    """
+    Reconcile trades_history.json against actual Kraken paper state.
+    Run at startup to fix any desync that built up between bot sessions.
+
+    Rules:
+      - Open BUY in our records but Kraken balance for that asset is ~0
+        → mark the position closed (it was sold outside or in a prior session)
+      - Kraken balance > 0 for an asset but no matching open BUY in our records
+        → log a warning (we can't reconstruct the entry price reliably)
+    """
+    logger = get_logger()
+
+    if mode != "paper":
+        logger.info("reconcile_state: live mode — skipping reconcile")
+        return
+
+    # -- Read Kraken paper state -------------------------------------------------
+    _PAPER_STATE = os.path.join(
+        os.path.expanduser("~"),
+        "AppData", "Roaming", "kraken", "paper", "state.json"
+    )
+    _PAIR_BASE = {
+        "XXBTZUSD": "BTC",
+        "XETHZUSD": "ETH",
+        "SOLUSD":   "SOL",
+    }
+
+    try:
+        with open(_PAPER_STATE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        kraken_balances = {k: float(v) for k, v in state.get("balances", {}).items()}
+    except Exception as exc:
+        logger.warning(f"reconcile_state: could not read Kraken state — {exc}")
+        return
+
+    history = _load_history()
+    changed = False
+
+    # -- Check every open BUY position ------------------------------------------
+    for trade in history:
+        if trade.get("action") != "BUY" or trade.get("status") != "open":
+            continue
+
+        pair   = trade.get("pair", "")
+        base   = _PAIR_BASE.get(pair)
+        if not base:
+            continue
+
+        kraken_bal = kraken_balances.get(base, 0.0)
+        amount     = float(trade.get("amount", 0))
+        pair_name  = PAIR_NAMES.get(pair, pair)
+
+        if kraken_bal < amount * 0.5:
+            # Kraken holds significantly less than our record — position was sold
+            logger.warning(
+                f"reconcile_state: {trade.get('trade_id')} {pair_name} "
+                f"marked 'open' but Kraken balance={kraken_bal:.8f} "
+                f"(expected >={amount}) — closing in portfolio"
+            )
+            print(
+                f"[Portfolio] Reconciled: {pair_name} [{trade.get('trade_id')}] "
+                f"closed (Kraken balance={kraken_bal:.8f}, expected {amount})"
+            )
+            trade["status"]         = "closed"
+            trade["closed_at"]      = datetime.now().isoformat()
+            trade["close_reason"]   = "reconciled_kraken_state"
+            trade["pnl"]            = trade.get("pnl", 0.0)
+            trade["unrealized_pnl"] = None
+            changed = True
+
+    # -- Check Kraken balances with no matching open record ---------------------
+    open_pairs = {
+        t.get("pair")
+        for t in history
+        if t.get("action") == "BUY" and t.get("status") == "open"
+    }
+    for pair, base in _PAIR_BASE.items():
+        kraken_bal = kraken_balances.get(base, 0.0)
+        if kraken_bal > 0 and pair not in open_pairs:
+            pair_name = PAIR_NAMES.get(pair, pair)
+            logger.warning(
+                f"reconcile_state: Kraken holds {kraken_bal} {base} "
+                f"but no open {pair_name} BUY in portfolio — "
+                f"manually investigate or re-buy via bot"
+            )
+            print(
+                f"[Portfolio] WARNING: Kraken holds {kraken_bal:.8f} {base} "
+                f"with no matching open position in portfolio"
+            )
+
+    if changed:
+        _save_history(history)
+        logger.info("reconcile_state: portfolio updated and saved")
+    else:
+        logger.info("reconcile_state: no discrepancies found — state is consistent")
 
 
 def get_portfolio_summary():

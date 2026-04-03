@@ -32,7 +32,9 @@ last_request_time = 0
 MIN_REQUEST_GAP = 2  # Wait at least 2 seconds between requests (safe limit)
  
  
-def get_trade_signal(indicators, recent_prices, current_price, pair="BTCUSD", holding=False):
+def get_trade_signal(indicators, recent_prices, current_price, pair="BTCUSD",
+                     holding=False, open_pnl_pct=None, force_decisive=False,
+                     all_holdings=None):
     """
     Send indicator data to Groq AI and get a trading decision.
     
@@ -120,15 +122,49 @@ def get_trade_signal(indicators, recent_prices, current_price, pair="BTCUSD", ho
     # --- Step 4: Build the AI prompt ---
     # Position status drives which actions are valid.
     if holding:
-        position_status = f"HOLDING {pair} — position is open"
-        valid_actions   = "SELL or HOLD  (BUY is NOT valid — already holding)"
+        if open_pnl_pct is not None:
+            pnl_direction = "LOSING" if open_pnl_pct < 0 else "WINNING"
+            position_status = (
+                f"HOLDING {pair} — open position is {pnl_direction} "
+                f"({open_pnl_pct:+.2f}%)"
+            )
+            if open_pnl_pct <= -2.5:
+                position_status += (
+                    "\n  *** NEAR STOP-LOSS — SELL IS STRONGLY RECOMMENDED "
+                    "unless RSI < 30 and there is a clear bounce signal ***"
+                )
+            elif open_pnl_pct <= -1.5:
+                position_status += (
+                    "\n  * Position in significant loss — evaluate exit carefully *"
+                )
+        else:
+            position_status = f"HOLDING {pair} — position is open (entry price unknown)"
+        valid_actions = "SELL or HOLD"
+        action_note   = "BUY is NOT valid — already holding"
     else:
         position_status = f"NOT HOLDING {pair} — no open position"
-        valid_actions   = "BUY or HOLD  (SELL is NOT valid — nothing to sell)"
+        valid_actions   = "BUY or HOLD"
+        action_note     = "SELL is NOT valid — nothing to sell"
 
-    prompt = f"""You are a short-term swing trader, not a long-term investor. Be decisive.
+    # Current portfolio holdings for context
+    holdings_list = all_holdings or []
+    holdings_str  = ", ".join(holdings_list) if holdings_list else "none"
+
+    # Force-decisive override instruction (used after 3 consecutive HOLDs)
+    force_note = (
+        "\n*** OVERRIDE: You have returned HOLD 3 times in a row for this pair. "
+        "You MUST return BUY or SELL now. HOLD is not an option this cycle. "
+        "Pick the best directional trade and commit to it. ***\n"
+        if force_decisive else ""
+    )
+
+    prompt = f"""{force_note}You are an active short-term swing trader. Be decisive.
 Analyze the following data for {pair} and make a clear BUY, SELL, or HOLD decision.
 Your timeframe is 15 minutes to 4 hours — you are hunting short-term opportunities.
+
+=== CURRENT PORTFOLIO HOLDINGS ===
+Currently holding: {holdings_str}
+(You can only SELL pairs you are currently holding. You can only BUY pairs you are NOT holding.)
 
 === CURRENT MARKET DATA ===
 Asset: {pair}
@@ -141,9 +177,8 @@ Regime: {market_regime}
 Regime Bias: {regime_bias}
 
 === POSITION STATUS ===
-Current position: {position_status}
-VALID ACTIONS FOR THIS TRADE: {valid_actions}
-You MUST only respond with one of the valid actions above. Choosing an invalid action wastes the trade opportunity.
+{position_status}
+Valid actions this cycle: {valid_actions}  ({action_note})
 
 === TECHNICAL INDICATORS ===
 RSI (14-period): {indicators.get('rsi', 'N/A')}
@@ -163,24 +198,28 @@ Price vs SMA: {indicators.get('price_vs_sma', 'N/A')}
 Overall Trend: {indicators.get('trend', 'N/A')}
 
 === TRADING RULES ===
-- You are a SHORT-TERM swing trader targeting 15min–4hr moves.
+- You are an ACTIVE swing trader. Only return HOLD if there is genuinely no clear signal.
+- If RSI, MACD, and Bollinger Bands all agree on direction, you MUST return BUY or SELL.
+- Aim for at least 4-6 trades per day across all pairs — do not sit idle.
 - Small dips of 1–3% in an otherwise stable asset are BUYING opportunities, not reasons to HOLD.
 - Even in a broader bearish market, there are bounce trades to catch — find them.
-- Use HOLD ONLY when indicators are genuinely mixed with no clear edge.
 - If the market regime is OVERSOLD or near the lower Bollinger Band, lean BUY.
 - If the market regime is OVERBOUGHT or near the upper Bollinger Band, lean SELL.
 - A bearish overall trend does NOT automatically mean HOLD — look for the bounce.
 - Be decisive: a clear signal at 55% confidence is better than a paralysed HOLD.
+- If you are holding a position that is LOSING more than 2%, SELL unless RSI < 30 shows a strong reversal.
+- If you are holding a position that is LOSING more than 2.5%, SELL immediately to protect capital.
 
 === RESPONSE FORMAT ===
-Respond with ONLY a valid JSON object, no extra text before or after:
+Valid actions: {valid_actions}  ({action_note})
+Respond with ONLY a valid JSON object — no markdown, no code blocks, no extra text:
 {{
-    "action": {valid_actions},
-    "confidence": 0.0 to 1.0,
+    "action": "...",
+    "confidence": 0.0,
     "reason": "brief 1-2 sentence explanation",
-    "suggested_size": "small" or "medium" or "large",
-    "stop_loss_pct": number between 1.0 and 5.0,
-    "take_profit_pct": number between 2.0 and 10.0
+    "suggested_size": "small",
+    "stop_loss_pct": 3.0,
+    "take_profit_pct": 5.0
 }}"""
  
     # --- Step 5: Call Groq API ---
@@ -196,18 +235,19 @@ Respond with ONLY a valid JSON object, no extra text before or after:
             "model": GROQ_MODEL,
             "messages": [
                 {
-                    # [CHANGE] System prompt now establishes the short-term swing
-                    # trader persona upfront, before any market data is shown.
                     "role": "system",
                     "content": (
-                        "You are an aggressive short-term crypto swing trader. "
-                        "Your job is to find and act on short-term price opportunities "
-                        "(15 min to 4 hr timeframe). "
+                        "You are an active swing trader. "
+                        "Only return HOLD if there is genuinely no clear signal. "
+                        "If RSI, MACD, and Bollinger Bands all agree on direction, "
+                        "you MUST return BUY or SELL. "
+                        "Aim for at least 4-6 trades per day across all pairs. "
                         "HOLD is your last resort — only use it when there is genuinely "
                         "no edge in either direction. "
-                        "In bearish markets, you look for bounce trades. "
-                        "In bullish markets, you look for continuation entries. "
-                        "Respond ONLY with a valid JSON object. No markdown, no code blocks, no extra text."
+                        "In bearish markets, look for bounce trades. "
+                        "In bullish markets, look for continuation entries. "
+                        "Respond ONLY with a valid JSON object. "
+                        "No markdown, no code blocks, no extra text."
                     )
                 },
                 {
@@ -289,7 +329,16 @@ Respond with ONLY a valid JSON object, no extra text before or after:
         # Validate stop_loss and take_profit are numbers
         signal["stop_loss_pct"] = float(signal.get("stop_loss_pct", 3.0))
         signal["take_profit_pct"] = float(signal.get("take_profit_pct", 5.0))
-        
+
+        # Enforce position constraint: override any invalid action the AI returned.
+        # This prevents SELL on unheld assets and BUY when already holding.
+        if holding and signal["action"] == "BUY":
+            print(f"[AI Brain] Overriding BUY → HOLD: already holding {pair}")
+            signal["action"] = "HOLD"
+        elif not holding and signal["action"] == "SELL":
+            print(f"[AI Brain] Overriding SELL → HOLD: not holding {pair}")
+            signal["action"] = "HOLD"
+
         # --- Step 9: Print the decision ---
         print(f"\n[AI Brain] === TRADE SIGNAL for {pair} ===")
         print(f"  Action:      {signal['action']}")
@@ -358,20 +407,20 @@ def should_trade(signal, portfolio_value=10000, open_positions=0,
     if action == "HOLD":
         return False, "AI recommends HOLD — no trade needed"
     
-    # Rule 2: Minimum confidence threshold
-    if confidence < 0.5:
-        return False, f"AI confidence too low ({confidence:.0%}). Need at least 50%"
-    
+    # Rule 2: Minimum confidence threshold (0.55 — decisive but not reckless)
+    if confidence < 0.55:
+        return False, f"AI confidence too low ({confidence:.0%}). Need at least 55%"
+
     # Rule 3: Maximum 3 open positions at any time
     if action == "BUY" and open_positions >= 3:
         return False, f"Already have {open_positions} open positions (max 3)"
-    
-    # Rule 4: Cooldown — wait at least 10 minutes between trades
-    # [CHANGE] Reduced from 30 min → 10 min to allow catching short-term swings.
+
+    # Rule 4: Cooldown — 10 min between BUYs; SELLs bypass cooldown entirely
+    # so risk management can exit positions immediately when needed.
     current_time = time.time()
     minutes_since_last = (current_time - last_trade_time) / 60
-    if last_trade_time > 0 and minutes_since_last < 10:
-        return False, f"Cooldown active: only {minutes_since_last:.0f}min since last trade (need 10min)"
+    if action == "BUY" and last_trade_time > 0 and minutes_since_last < 10:
+        return False, f"Cooldown active: only {minutes_since_last:.0f}min since last BUY (need 10min)"
     
     # Rule 5: Daily loss limit — stop if lost more than 10% today
     daily_loss_limit = portfolio_value * 0.10  # 10% of portfolio

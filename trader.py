@@ -154,6 +154,20 @@ def _parse_trade_output(output):
     if id_match:
         parsed["order_id"] = id_match.group(1)
 
+    # --- Kraken CLI table format (box-drawing chars) ---
+    # e.g.  │ Price    ┆ 83.26                     │
+    #       │ Price    ┆ 68,328.70                 │
+    if not parsed["price"]:
+        table_price = re.search(r'Price\s+\S+\s+([\d,]+\.?\d*)', output)
+        if table_price:
+            parsed["price"] = float(table_price.group(1).replace(",", ""))
+
+    # e.g.  │ Trade ID ┆ PAPER-00008               │
+    if not parsed["order_id"]:
+        table_id = re.search(r'Trade ID\s+\S+\s+([A-Z0-9-]+)', output)
+        if table_id:
+            parsed["order_id"] = table_id.group(1)
+
     parsed["status"] = "executed"
     return parsed
 
