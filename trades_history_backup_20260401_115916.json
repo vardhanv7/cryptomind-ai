@@ -1,0 +1,32 @@
+[
+  {
+    "pair": "XXBTZUSD",
+    "action": "BUY",
+    "amount": 0.001,
+    "price": null,
+    "order_id": null,
+    "timestamp": "2026-04-01T11:44:00.375823",
+    "mode": "paper",
+    "success": true,
+    "error": null,
+    "raw_output": "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 Field    \u2506 Value                     \u2502\n\u255e\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u256a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2561\n\u2502 Mode     \u2506 [PAPER] Simulated Trading \u2502\n\u2502 Action   \u2506 Market Buy executed       \u2502\n\u2502 Trade ID \u2506 PAPER-00014               \u2502\n\u2502 Pair     \u2506 XXBTZUSD                  \u2502\n\u2502 Volume   \u2506 0.00100000                \u2502\n\u2502 Price    \u2506 68580.50                  \u2502\n\u2502 Fee      \u2506 0.1783                    \u2502\n\u2502 Cost     \u2506 68.58                     \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518"
+  },
+  {
+    "trade_id": "TRD-0002",
+    "timestamp": "2026-04-01T11:44:00.375823",
+    "pair": "XXBTZUSD",
+    "action": "BUY",
+    "amount": 0.001,
+    "price": null,
+    "cost_usd": null,
+    "ai_confidence": 0.7,
+    "ai_reason": "The price is in a neutral range with a bullish overall trend, and recent dips have been small, making it a buying opportunity. The RSI is also in a neutral range, indicating potential for further upside.",
+    "stop_loss_pct": 2.5,
+    "take_profit_pct": 5.0,
+    "status": "open",
+    "pnl": 0.0,
+    "unrealized_pnl": null,
+    "mode": "paper",
+    "order_id": null
+  }
+]
